@@ -1,0 +1,29 @@
+name: Techno GBG Event Crawler
+
+on:
+  schedule:
+    # 08:00 Stockholm time = 06:00 UTC (winter) / 07:00 UTC (summer)
+    # Running at 06:00 UTC covers both winter and summer safely
+    - cron: "0 6 * * *"
+  workflow_dispatch:  # allows manual trigger from GitHub UI
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: python scraper.py
