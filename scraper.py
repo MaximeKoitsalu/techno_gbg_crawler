@@ -44,7 +44,7 @@ def get_sheet():
     return client.open(SHEET_NAME).worksheet(WORKSHEET)
 
 def ensure_headers(sheet):
-    expected = ["Event name", "Date", "Date (raw)", "Source", "Genre hint", "Suggested song", "Status", "Added"]
+    expected = ["Event name", "Date", "Date (raw)", "Source", "Signup URL", "Genre hint", "Suggested song", "Status", "Added"]
     if sheet.row_values(1) != expected:
         sheet.update(range_name="A1", values=[expected])
 
@@ -58,16 +58,15 @@ def fmt_date(d):
 def parse_date(text):
     t = text.lower().strip()
     t = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", t)
-    # digits then month word: "15 maj", "2 may"
+    # digits then month word: "15 maj", "2 may", "1 augusti"
     m = re.search(r"(\d{1,2})\s+([a-z]+)", t)
     if m:
         day, mon = int(m.group(1)), m.group(2)
         month = ALL_MONTHS.get(mon)
         if month:
-            year = TODAY.year
             try:
-                d = datetime.date(year, month, day)
-                return datetime.date(year + 1, month, day) if d < TODAY else d
+                d = datetime.date(TODAY.year, month, day)
+                return datetime.date(TODAY.year + 1, month, day) if d < TODAY else d
             except ValueError:
                 pass
     # month word then digits: "may 2", "june 26"
@@ -76,30 +75,12 @@ def parse_date(text):
         mon, day = m.group(1), int(m.group(2))
         month = ALL_MONTHS.get(mon)
         if month:
-            year = TODAY.year
             try:
-                d = datetime.date(year, month, day)
-                return datetime.date(year + 1, month, day) if d < TODAY else d
+                d = datetime.date(TODAY.year, month, day)
+                return datetime.date(TODAY.year + 1, month, day) if d < TODAY else d
             except ValueError:
                 pass
     return None
-
-def clean_name(text):
-    t = text.strip()
-    # Remove Swedish/English weekday names
-    t = re.sub(
-        r"\b(måndag|tisdag|onsdag|torsdag|fredag|lördag|söndag|"
-        r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-        "", t, flags=re.IGNORECASE
-    )
-    # Remove date patterns like "15 maj", "May 2nd", "June 26"
-    t = re.sub(r"\b\d{1,2}(st|nd|rd|th)?\s+[a-zA-ZåäöÅÄÖ]+\b", "", t)
-    t = re.sub(r"\b[a-zA-ZåäöÅÄÖ]+\s+\d{1,2}(st|nd|rd|th)?\b", "", t)
-    # Remove leftover punctuation
-    t = re.sub(r"[,:]+", "", t).strip()
-    # Collapse whitespace
-    t = re.sub(r"\s+", " ", t).strip()
-    return t.upper()
 
 def guess_genre(text):
     t = text.lower()
@@ -125,54 +106,61 @@ def suggest_song(genre):
 
 # ── Scraper ───────────────────────────────────────────────────────────────────
 def scrape_progek():
+    """
+    Exact HTML structure (confirmed):
+      <td valign="top">
+        <a href="https://progek.se/frequency" target="_blank"><img ...></a>
+        <p style="font-size: small">Frequency: CURRENT VALUE<br>Saturday May 2nd</p>
+      </td>
+
+    Strategy: find all <p style="font-size: small"> tags.
+    Each contains event name (before <br>) and date (after <br>).
+    The signup URL is on the <a> tag in the same <td>.
+    Stop when we hit the "Nedanst" paragraph.
+    """
     events = []
     resp = requests.get("https://progek.se", headers=HEADERS, timeout=15)
     resp.raise_for_status()
+    resp.encoding = "iso-8859-1"  # page declares charset=iso-8859-1
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Force Windows-1252 encoding — progek.se uses this, not UTF-8
-    resp.encoding = "windows-1252"
-    html = resp.text
+    for p in soup.find_all("p", style=lambda s: s and "font-size: small" in s):
+        # Get the two text parts split by <br>
+        parts = p.get_text("\n").strip().split("\n")
+        parts = [x.strip() for x in parts if x.strip()]
+        if len(parts) < 2:
+            continue
 
-    soup = BeautifulSoup(html, "html.parser")
+        name_raw = parts[0]
+        date_raw = parts[1]
 
-    # Find the bold "Kommande fester" marker
-    marker = None
-    for tag in soup.find_all(["b", "strong"]):
-        if "kommande fester" in tag.get_text().lower():
-            marker = tag
-            break
+        # Strip city prefix like "Göteborg, "
+        name_clean = re.sub(r"^[A-ZÅÄÖ][a-zåäö]+,\s*", "", name_raw).strip()
+        name = name_clean.upper()
 
-    if not marker:
-        print("[progek] Could not find 'Kommande fester' section")
-        print("[progek] Page text snippet:", soup.get_text()[:500])
-        return events
+        date = parse_date(date_raw)
+        if not date:
+            print(f"[progek] Could not parse date '{date_raw}' for '{name}' — skipping")
+            continue
 
-    stop = "nedanstående arrangörer har använt"
+        # Get signup URL from the <a> in the parent <td>
+        td = p.find_parent("td")
+        signup_url = ""
+        if td:
+            a = td.find("a", href=True)
+            if a:
+                signup_url = a["href"]
 
-    for table in marker.find_all_next("table"):
-        if stop in table.get_text().lower():
-            break
-        for link in table.find_all("a"):
-            raw = link.get_text(" ", strip=True)
-            if not raw:
-                continue
-            date = parse_date(raw)
-            if not date:
-                print(f"[progek] No date found in: '{raw}' — skipping")
-                continue
-            name = clean_name(raw)
-            if not name:
-                slug = link.get("href", "").strip("/").split("/")[-1]
-                name = slug.upper().replace("-", " ")
-            genre = guess_genre(raw)
-            events.append({
-                "name":   name,
-                "date":   date,
-                "source": "progek.se",
-                "genre":  genre,
-                "song":   suggest_song(genre),
-            })
-            print(f"[progek] Found: {name} — {date}")
+        genre = guess_genre(name_raw)
+        events.append({
+            "name":       name,
+            "date":       date,
+            "source":     "progek.se",
+            "signup_url": signup_url,
+            "genre":      genre,
+            "song":       suggest_song(genre),
+        })
+        print(f"[progek] Found: {name} — {date} — {signup_url}")
 
     print(f"[progek] {len(events)} upcoming events found")
     return events
@@ -193,6 +181,7 @@ def write_to_sheet(events):
             fmt_date(e["date"]),
             e["date"].isoformat(),
             e["source"],
+            e["signup_url"],
             e["genre"],
             e["song"],
             "pending",
