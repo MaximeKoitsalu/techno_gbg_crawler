@@ -1,11 +1,10 @@
 """
 Techno GBG — Event Crawler
-Scrapes RA and progek.se, deduplicates, writes new events to Google Sheets.
+Scrapes progek.se for upcoming Gothenburg events, writes new ones to Google Sheets.
 """
 
 import os
 import re
-import time
 import datetime
 import requests
 from bs4 import BeautifulSoup
@@ -13,14 +12,13 @@ import gspread
 from google.oauth2.service_account import Credentials
 import json
 
-# ── Config ─────────────────────────────────────────────────────────────────
-SHEET_NAME   = "Techno GBG Events"   # name of your Google Sheet
-WORKSHEET    = "Events"              # tab name inside the sheet
-SCOPES       = [
+# ── Config ──────────────────────────────────────────────────────────────────
+SHEET_NAME = "Techno GBG Events"
+WORKSHEET  = "Events"
+SCOPES     = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -31,262 +29,205 @@ HEADERS = {
 
 TODAY = datetime.date.today()
 
-# ── Google Sheets auth ──────────────────────────────────────────────────────
+SWEDISH_MONTHS = {
+    "januari": 1, "februari": 2, "mars": 3, "april": 4,
+    "maj": 5, "juni": 6, "juli": 7, "augusti": 8,
+    "september": 9, "oktober": 10, "november": 11, "december": 12,
+}
+ENGLISH_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+}
+ALL_MONTHS = {**SWEDISH_MONTHS, **ENGLISH_MONTHS}
+
+# ── Google Sheets ────────────────────────────────────────────────────────────
 def get_sheet():
-    creds_json = os.environ["GOOGLE_CREDENTIALS"]
-    creds_dict = json.loads(creds_json)
+    creds_dict = json.loads(os.environ["GOOGLE_CREDENTIALS"])
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     client = gspread.authorize(creds)
-    sheet = client.open(SHEET_NAME).worksheet(WORKSHEET)
-    return sheet
-
+    return client.open(SHEET_NAME).worksheet(WORKSHEET)
 
 def ensure_headers(sheet):
-    first_row = sheet.row_values(1)
     expected = ["Event name", "Date", "Date (raw)", "Source", "Genre hint", "Suggested song", "Status", "Added"]
-    if first_row != expected:
+    if sheet.row_values(1) != expected:
         sheet.update("A1", [expected])
 
-
 def existing_keys(sheet):
-    """Return a set of 'name|date' strings already in the sheet."""
-    records = sheet.get_all_records()
-    return {f"{r['Event name'].lower()}|{r['Date (raw)']}" for r in records}
+    return {f"{r['Event name'].lower()}|{r['Date (raw)']}" for r in sheet.get_all_records()}
 
-
-# ── Helpers ─────────────────────────────────────────────────────────────────
-def fmt_date(d: datetime.date) -> str:
-    """DD-MM-YY display format."""
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def fmt_date(d):
     return d.strftime("%d-%m-%y")
 
+def parse_date(text):
+    """
+    Parse date from progek event text. Handles:
+      "Fredag 15 maj", "Lördag 30 maj", "Saturday May 2nd", "Friday June 26th"
+    Year assumed current, bumped to next year if already passed.
+    """
+    t = text.lower().strip()
+    # Remove ordinal suffixes: 2nd -> 2
+    t = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", t)
 
-def raw_date(d: datetime.date) -> str:
-    """YYYY-MM-DD for dedup key."""
-    return d.isoformat()
+    # Try: digits then month word
+    m = re.search(r"(\d{1,2})\s+([a-zåäö]+)", t)
+    if m:
+        day, month_str = int(m.group(1)), m.group(2)
+        month = ALL_MONTHS.get(month_str)
+        if month:
+            year = TODAY.year
+            try:
+                d = datetime.date(year, month, day)
+                if d < TODAY:
+                    d = datetime.date(year + 1, month, day)
+                return d
+            except ValueError:
+                pass
 
+    # Try: month word then digits
+    m = re.search(r"([a-zåäö]+)\s+(\d{1,2})", t)
+    if m:
+        month_str, day = m.group(1), int(m.group(2))
+        month = ALL_MONTHS.get(month_str)
+        if month:
+            year = TODAY.year
+            try:
+                d = datetime.date(year, month, day)
+                if d < TODAY:
+                    d = datetime.date(year + 1, month, day)
+                return d
+            except ValueError:
+                pass
 
-def guess_genre(text: str) -> str:
+    return None
+
+def clean_name(text):
+    """Strip date/weekday parts, return uppercase event name."""
+    t = text.strip()
+    weekdays = (
+        r"(måndag|tisdag|onsdag|torsdag|fredag|lördag|söndag|"
+        r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    )
+    # Remove weekday
+    t = re.sub(weekdays, "", t, flags=re.IGNORECASE).strip(",: ")
+    # Remove trailing date pattern like "15 maj" or "May 2"
+    t = re.sub(r"\d{1,2}\s+\w+$", "", t, flags=re.IGNORECASE).strip(",: ")
+    t = re.sub(r"\w+\s+\d{1,2}$", "", t, flags=re.IGNORECASE).strip(",: ")
+    # Remove ordinals
+    t = re.sub(r"\d+(st|nd|rd|th)", "", t).strip(",: ")
+    return t.upper() if t else ""
+
+def guess_genre(text):
     text = text.lower()
-    for genre, keywords in [
+    for genre, kws in [
         ("dnb",        ["drum and bass", "dnb", "drum & bass"]),
-        ("psytrance",  ["psytrance", "psy trance", "psychedelic trance"]),
-        ("melodic",    ["melodic", "afro house", "organic"]),
+        ("psytrance",  ["psytrance", "psy", "psychedelic", "goa"]),
+        ("melodic",    ["melodic", "afro", "organic"]),
         ("deep house", ["deep house", "deep tech"]),
-        ("techno",     ["techno", "industrial", "ebm", "hard techno"]),
+        ("techno",     ["techno", "industrial", "ebm"]),
     ]:
-        if any(k in text for k in keywords):
+        if any(k in text for k in kws):
             return genre
-    return "techno"  # default
+    return "techno"
 
-
-def suggest_song(genre: str) -> str:
-    suggestions = {
+def suggest_song(genre):
+    return {
         "techno":     "Ben Klock – Subzero",
         "melodic":    "Innellea – Moana",
         "deep house": "Kerri Chandler – Atmosphere",
         "psytrance":  "Astrix – Red Means Distortion",
         "dnb":        "Noisia – Machine Gun (Camo & Krooked Remix)",
-    }
-    return suggestions.get(genre, "Ben Klock – Subzero")
+    }.get(genre, "Ben Klock – Subzero")
 
-
-# ── Scraper: Resident Advisor ───────────────────────────────────────────────
-def scrape_ra() -> list[dict]:
+# ── Scraper ───────────────────────────────────────────────────────────────────
+def scrape_progek():
     """
-    Scrape RA events listing for Gothenburg.
-    RA area ID 45 = Gothenburg/Göteborg.
+    Finds the 'Kommande fester med gästlista' section on progek.se,
+    collects all linked events in the tables that follow,
+    stops before 'Nedanstående arrangörer har använt gästlista'.
     """
     events = []
-    url = "https://ra.co/events/se/gothenburg"
+    resp = requests.get("https://progek.se", headers=HEADERS, timeout=15)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.content, "html.parser")
 
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[RA] Request failed: {e}")
+    # Find the bold marker tag
+    marker = None
+    for tag in soup.find_all(["b", "strong"]):
+        if "kommande fester" in tag.get_text().lower():
+            marker = tag
+            break
+
+    if not marker:
+        print("[progek] Section marker not found — page may have changed")
         return events
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    stop = "nedanstående arrangörer har använt"
 
-    # RA renders server-side event listings in <article> or <li> tags
-    # with data attributes — try multiple selectors as RA updates their markup
-    articles = (
-        soup.select("article[data-testid='event-item']") or
-        soup.select("li[data-testid='event-item']") or
-        soup.select("article.event-item") or
-        soup.select("[class*='eventItem']")
-    )
-
-    for article in articles:
-        try:
-            # Event title
-            title_el = (
-                article.select_one("h3") or
-                article.select_one("h2") or
-                article.select_one("[class*='title']")
-            )
-            if not title_el:
+    # Walk forward through tables until stop text
+    for table in marker.find_all_next("table"):
+        if stop in table.get_text().lower():
+            break
+        for link in table.find_all("a"):
+            raw = link.get_text(" ", strip=True)
+            if not raw:
                 continue
-            name = title_el.get_text(strip=True).upper()
-
-            # Date — look for time element or date string
-            time_el = article.select_one("time")
-            if time_el and time_el.get("datetime"):
-                raw = time_el["datetime"][:10]  # YYYY-MM-DD
-                event_date = datetime.date.fromisoformat(raw)
-            else:
-                # try to find a date string in text
-                date_text = article.get_text()
-                date_match = re.search(r"(\d{1,2})\s+(\w+)\s+(\d{4})", date_text)
-                if not date_match:
-                    continue
-                try:
-                    event_date = datetime.datetime.strptime(
-                        date_match.group(0), "%d %B %Y"
-                    ).date()
-                except ValueError:
-                    continue
-
-            if event_date < TODAY:
+            date = parse_date(raw)
+            if not date:
+                print(f"[progek] No date in: '{raw}' — skipping")
                 continue
-
-            genre = guess_genre(article.get_text())
+            name = clean_name(raw)
+            if not name:
+                # Fall back to URL slug
+                slug = link.get("href", "").strip("/").split("/")[-1]
+                name = slug.upper().replace("-", " ")
+            genre = guess_genre(raw)
             events.append({
                 "name":   name,
-                "date":   event_date,
-                "source": "RA",
-                "genre":  genre,
-                "song":   suggest_song(genre),
-            })
-        except Exception as e:
-            print(f"[RA] Parse error: {e}")
-            continue
-
-    print(f"[RA] Found {len(events)} upcoming events")
-    return events
-
-
-# ── Scraper: progek.se ──────────────────────────────────────────────────────
-def scrape_progek() -> list[dict]:
-    events = []
-    url = "https://progek.se/kalender/"
-
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"[progek] Request failed: {e}")
-        return events
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # progek uses WordPress-style event listings
-    items = (
-        soup.select(".event") or
-        soup.select(".tribe-event") or
-        soup.select("article.type-tribe_events") or
-        soup.select("[class*='event']")
-    )
-
-    for item in items:
-        try:
-            title_el = item.select_one("h2, h3, .tribe-event-url, [class*='title']")
-            if not title_el:
-                continue
-            name = title_el.get_text(strip=True).upper()
-
-            # Look for date in time tag or abbr
-            time_el = item.select_one("time, abbr[class*='dtstart'], [class*='start-date']")
-            if time_el:
-                raw = (time_el.get("datetime") or time_el.get("title") or "")[:10]
-                try:
-                    event_date = datetime.date.fromisoformat(raw)
-                except ValueError:
-                    continue
-            else:
-                # fallback: scan text for Swedish date patterns (e.g. "12 april 2026")
-                SWEDISH_MONTHS = {
-                    "januari": 1, "februari": 2, "mars": 3, "april": 4,
-                    "maj": 5, "juni": 6, "juli": 7, "augusti": 8,
-                    "september": 9, "oktober": 10, "november": 11, "december": 12
-                }
-                text = item.get_text().lower()
-                m = re.search(r"(\d{1,2})\s+(\w+)\s+(\d{4})", text)
-                if not m:
-                    continue
-                day, month_str, year = m.groups()
-                month = SWEDISH_MONTHS.get(month_str)
-                if not month:
-                    continue
-                event_date = datetime.date(int(year), month, int(day))
-
-            if event_date < TODAY:
-                continue
-
-            genre = guess_genre(item.get_text())
-            events.append({
-                "name":   name,
-                "date":   event_date,
+                "date":   date,
                 "source": "progek.se",
                 "genre":  genre,
                 "song":   suggest_song(genre),
             })
-        except Exception as e:
-            print(f"[progek] Parse error: {e}")
-            continue
+            print(f"[progek] {name} — {date}")
 
-    print(f"[progek] Found {len(events)} upcoming events")
+    print(f"[progek] {len(events)} upcoming events found")
     return events
 
-
-# ── Write to Google Sheets ──────────────────────────────────────────────────
-def write_to_sheet(events: list[dict]):
-    if not events:
-        print("No new events to write.")
-        return
-
+# ── Write to sheet ────────────────────────────────────────────────────────────
+def write_to_sheet(events):
     sheet = get_sheet()
     ensure_headers(sheet)
     existing = existing_keys(sheet)
-
     new_rows = []
-    for e in events:
-        key = f"{e['name'].lower()}|{raw_date(e['date'])}"
+    for e in sorted(events, key=lambda x: x["date"]):
+        key = f"{e['name'].lower()}|{e['date'].isoformat()}"
         if key in existing:
+            print(f"[sheet] Already exists: {e['name']}")
             continue
         new_rows.append([
             e["name"],
             fmt_date(e["date"]),
-            raw_date(e["date"]),
+            e["date"].isoformat(),
             e["source"],
             e["genre"],
             e["song"],
             "pending",
             TODAY.isoformat(),
         ])
-
     if not new_rows:
-        print("All events already in sheet.")
+        print("[sheet] Nothing new to add.")
         return
-
     sheet.append_rows(new_rows, value_input_option="USER_ENTERED")
-    print(f"Added {len(new_rows)} new events to sheet.")
+    print(f"[sheet] Added {len(new_rows)} new event(s).")
 
-
-# ── Main ────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    print(f"Running scraper — {TODAY}")
-    all_events = []
-    all_events.extend(scrape_ra())
-    time.sleep(2)
-    all_events.extend(scrape_progek())
-
-    # Sort by date
-    all_events.sort(key=lambda e: e["date"])
-
-    write_to_sheet(all_events)
+    print(f"Techno GBG crawler — {TODAY}")
+    events = scrape_progek()
+    write_to_sheet(events)
     print("Done.")
-
 
 if __name__ == "__main__":
     main()
